@@ -728,6 +728,30 @@ def generate_video(args):
         transformer_dtype=transformer_dtype,
         action_ckpt=args.action_ckpt,
     )
+    if args.use_sdtm:
+        pipe.transformer.enable_sdtm(
+            ratio=args.sdtm_ratio,
+            deviation=args.sdtm_deviation,
+            switch_step=args.sdtm_switch_step,
+            use_rand=args.sdtm_use_rand,
+            sx=args.sdtm_sx,
+            sy=args.sdtm_sy,
+            a_s=args.sdtm_a_s,
+            adaptive_ssm=args.sdtm_adaptive_ssm,
+            ssm_threshold=args.sdtm_ssm_threshold,
+            low_complexity_threshold=args.sdtm_low_complexity_threshold,
+            high_complexity_threshold=args.sdtm_high_complexity_threshold,
+            pseudo_merge=args.sdtm_pseudo_merge,
+            mcw=args.sdtm_mcw,
+            protect_steps_frequency=args.sdtm_protect_steps_frequency,
+            protect_layers_frequency=args.sdtm_protect_layers_frequency,
+            cache_each_step=args.sdtm_cache_each_step,
+            merge_attn=args.sdtm_merge_attn,
+            merge_mlp=args.sdtm_merge_mlp,
+            auto_window=args.sdtm_auto_window,
+            slic_alpha=args.sdtm_slic_alpha,
+            verbose=args.sdtm_verbose,
+        )
 
     extra_kwargs = {}
     if task == "i2v":
@@ -1052,6 +1076,83 @@ def main():
         help="Keep transformer on GPU for entire AR rollout instead of per-chunk offloading (default: false). "
         "Reduces inference time without increasing peak VRAM. Only affects AR model_type with offloading enabled. "
         "Use --transformer_resident_ar_rollout or --transformer_resident_ar_rollout true to enable.",
+    )
+    parser.add_argument(
+        "--use_sdtm",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable SDTM token merging for HunyuanVideo WorldPlay inference.",
+    )
+    parser.add_argument("--sdtm_ratio", type=float, default=0.3)
+    parser.add_argument("--sdtm_deviation", type=float, default=0.2)
+    parser.add_argument("--sdtm_switch_step", type=int, default=20)
+    parser.add_argument(
+        "--sdtm_use_rand",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=True,
+    )
+    parser.add_argument("--sdtm_sx", type=int, default=4)
+    parser.add_argument("--sdtm_sy", type=int, default=4)
+    parser.add_argument("--sdtm_a_s", type=float, default=0.05)
+    parser.add_argument(
+        "--sdtm_adaptive_ssm",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    parser.add_argument("--sdtm_ssm_threshold", type=float, default=0.0)
+    parser.add_argument("--sdtm_low_complexity_threshold", type=float, default=0.66)
+    parser.add_argument("--sdtm_high_complexity_threshold", type=float, default=0.33)
+    parser.add_argument(
+        "--sdtm_pseudo_merge",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    parser.add_argument("--sdtm_mcw", type=float, default=0.2)
+    parser.add_argument("--sdtm_protect_steps_frequency", type=int, default=3)
+    parser.add_argument("--sdtm_protect_layers_frequency", type=int, default=-1)
+    parser.add_argument(
+        "--sdtm_cache_each_step",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=True,
+    )
+    parser.add_argument(
+        "--sdtm_merge_attn",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=True,
+    )
+    parser.add_argument(
+        "--sdtm_merge_mlp",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=True,
+    )
+    parser.add_argument(
+        "--sdtm_auto_window",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=True,
+    )
+    parser.add_argument("--sdtm_slic_alpha", type=float, default=0.5)
+    parser.add_argument(
+        "--sdtm_verbose",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
     )
 
     args = parser.parse_args()

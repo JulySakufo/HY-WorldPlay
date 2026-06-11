@@ -41,6 +41,14 @@ from .modules.posemb_layers import apply_rotary_emb, get_nd_rotary_pos_embed
 from .modules.mlp_layers import MLP, MLPEmbedder, FinalLayer, LinearWarpforSingle
 from .modules.modulate_layers import ModulateDiT, modulate, apply_gate
 from .modules.token_refiner import SingleTokenRefiner
+from .sdtm import (
+    begin_sdtm_run,
+    build_sdtm_info,
+    disable_sdtm,
+    get_sdtm_context,
+    set_sdtm_step,
+    store_sdtm_feature,
+)
 
 from hyvideo.utils.communications import all_gather
 from hyvideo.utils.infer_utils import torch_compile_wrapper
@@ -314,37 +322,56 @@ class MMDoubleStreamBlock(nn.Module):
         cache_vision: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         (
-            img_q,
-            img_k,
-            img_v,
+            img_mod1_shift,
+            img_mod1_scale,
             img_mod1_gate,
             img_mod2_shift,
             img_mod2_scale,
             img_mod2_gate,
-        ) = self.modulate_img(vec, img)
+        ) = self.img_mod(vec).chunk(6, dim=-1)
+
+        img_modulated = self.img_norm1(img)
+        img_modulated = modulate(
+            img_modulated, shift=img_mod1_shift, scale=img_mod1_scale
+        )
+        sdtm_ctx = get_sdtm_context(
+            img_modulated,
+            getattr(self, "_sdtm_info", None),
+            attn_param=attn_param,
+            block_idx=block_idx,
+            cache_vision=cache_vision,
+        )
+        img_modulated_attn = sdtm_ctx.merge_attn(img_modulated)
+
+        img_q = self.img_attn_q(img_modulated_attn)
+        img_k = self.img_attn_k(img_modulated_attn)
+        img_v = self.img_attn_v(img_modulated_attn)
+        img_q = rearrange(img_q, "B L (H D) -> B L H D", H=self.heads_num)
+        img_k = rearrange(img_k, "B L (H D) -> B L H D", H=self.heads_num)
+        img_v = rearrange(img_v, "B L (H D) -> B L H D", H=self.heads_num)
+        img_q = self.img_attn_q_norm(img_q).to(img_v)
+        img_k = self.img_attn_k_norm(img_k).to(img_v)
+
+        viewmats_attn = sdtm_ctx.prune_attn_like(viewmats)
+        Ks_attn = sdtm_ctx.prune_attn_like(Ks)
+        freqs_cis_attn = sdtm_ctx.prune_attn_freqs(freqs_cis)
 
         # Add camera pose conditioning through ProPE (Projective Positional Encoding)
-        # delete rope components (original attn included)
-        # Apply ProPE transformation to Q, K, V using camera view matrices and intrinsics
         img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv(
             img_q.permute(0, 2, 1, 3),
             img_k.permute(0, 2, 1, 3),
             img_v.permute(0, 2, 1, 3),
-            viewmats=viewmats,
-            Ks=Ks,
+            viewmats=viewmats_attn,
+            Ks=Ks_attn,
         )  # [batch, num_heads, seqlen, head_dim]
-        img_q_prope = img_q_prope.permute(
-            0, 2, 1, 3
-        )  # [batch, seqlen, num_heads, head_dim]
-        img_k_prope = img_k_prope.permute(
-            0, 2, 1, 3
-        )  # [batch, seqlen, num_heads, head_dim]
-        img_v_prope = img_v_prope.permute(
-            0, 2, 1, 3
-        )  # [batch, seqlen, num_heads, head_dim]
+        img_q_prope = img_q_prope.permute(0, 2, 1, 3)
+        img_k_prope = img_k_prope.permute(0, 2, 1, 3)
+        img_v_prope = img_v_prope.permute(0, 2, 1, 3)
 
-        if freqs_cis is not None:
-            img_qq, img_kk = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
+        if freqs_cis_attn is not None:
+            img_qq, img_kk = apply_rotary_emb(
+                img_q, img_k, freqs_cis_attn, head_first=False
+            )
             assert (
                 img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
             ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
@@ -362,23 +389,27 @@ class MMDoubleStreamBlock(nn.Module):
         img_attn_prope = rearrange(
             img_attn_prope, "B L (H D) -> B H L D", H=self.heads_num
         )
-        img_attn_prope = apply_fn_o(
-            img_attn_prope
-        )  # [batch, num_heads, seqlen, head_dim]
+        img_attn_prope = apply_fn_o(img_attn_prope)
         img_attn_prope = rearrange(img_attn_prope, "B H L D -> B L (H D)")
 
-        img = img + apply_gate(
-            self.img_attn_proj(img_attn) + self.img_attn_prope_proj(img_attn_prope),
-            gate=img_mod1_gate,
+        attn_output = self.img_attn_proj(img_attn) + self.img_attn_prope_proj(
+            img_attn_prope
         )
-        img = img + apply_gate(
-            self.img_mlp(
-                modulate(
-                    self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale
-                )
-            ),
-            gate=img_mod2_gate,
+        attn_output = sdtm_ctx.unmerge_attn(attn_output, phase="attn_output")
+        store_sdtm_feature(
+            getattr(self, "_sdtm_info", None), "attn_output", block_idx, attn_output
         )
+        img = img + apply_gate(attn_output, gate=img_mod1_gate)
+
+        mlp_input = self.img_norm2(img)
+        mlp_input = modulate(mlp_input, shift=img_mod2_shift, scale=img_mod2_scale)
+        mlp_input = sdtm_ctx.merge_mlp(mlp_input)
+        mlp_output = self.img_mlp(mlp_input)
+        mlp_output = sdtm_ctx.unmerge_mlp(mlp_output, phase="mlp_output")
+        store_sdtm_feature(
+            getattr(self, "_sdtm_info", None), "mlp_output", block_idx, mlp_output
+        )
+        img = img + apply_gate(mlp_output, gate=img_mod2_gate)
 
         return img, vision_kv
 
@@ -398,14 +429,35 @@ class MMDoubleStreamBlock(nn.Module):
         Ks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         (
-            img_q,
-            img_k,
-            img_v,
+            img_mod1_shift,
+            img_mod1_scale,
             img_mod1_gate,
             img_mod2_shift,
             img_mod2_scale,
             img_mod2_gate,
-        ) = self.modulate_img(vec, img)
+        ) = self.img_mod(vec).chunk(6, dim=-1)
+
+        img_modulated = self.img_norm1(img)
+        img_modulated = modulate(
+            img_modulated, shift=img_mod1_shift, scale=img_mod1_scale
+        )
+        sdtm_ctx = get_sdtm_context(
+            img_modulated,
+            getattr(self, "_sdtm_info", None),
+            attn_param=attn_param,
+            block_idx=block_idx,
+            cache_vision=False,
+        )
+        img_modulated_attn = sdtm_ctx.merge_attn(img_modulated)
+
+        img_q = self.img_attn_q(img_modulated_attn)
+        img_k = self.img_attn_k(img_modulated_attn)
+        img_v = self.img_attn_v(img_modulated_attn)
+        img_q = rearrange(img_q, "B L (H D) -> B L H D", H=self.heads_num)
+        img_k = rearrange(img_k, "B L (H D) -> B L H D", H=self.heads_num)
+        img_v = rearrange(img_v, "B L (H D) -> B L H D", H=self.heads_num)
+        img_q = self.img_attn_q_norm(img_q).to(img_v)
+        img_k = self.img_attn_k_norm(img_k).to(img_v)
         (
             txt_q,
             txt_k,
@@ -416,13 +468,17 @@ class MMDoubleStreamBlock(nn.Module):
             txt_mod2_gate,
         ) = self.modulate_txt(vec_txt, txt)
 
+        viewmats_attn = sdtm_ctx.prune_attn_like(viewmats)
+        Ks_attn = sdtm_ctx.prune_attn_like(Ks)
+        freqs_cis_attn = sdtm_ctx.prune_attn_freqs(freqs_cis)
+
         # add camera pose through prope
         img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv(
             img_q.permute(0, 2, 1, 3),
             img_k.permute(0, 2, 1, 3),
             img_v.permute(0, 2, 1, 3),
-            viewmats=viewmats,
-            Ks=Ks,
+            viewmats=viewmats_attn,
+            Ks=Ks_attn,
         )  # [batch, num_heads, seqlen, head_dim]
         img_q_prope = img_q_prope.permute(
             0, 2, 1, 3
@@ -434,8 +490,10 @@ class MMDoubleStreamBlock(nn.Module):
             0, 2, 1, 3
         )  # [batch, seqlen, num_heads, head_dim]
 
-        if freqs_cis is not None:
-            img_qq, img_kk = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
+        if freqs_cis_attn is not None:
+            img_qq, img_kk = apply_rotary_emb(
+                img_q, img_k, freqs_cis_attn, head_first=False
+            )
             assert (
                 img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
             ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
@@ -478,18 +536,24 @@ class MMDoubleStreamBlock(nn.Module):
         )  # [batch, num_heads, seqlen, head_dim]
         img_attn_prope = rearrange(img_attn_prope, "B H L D -> B L (H D)")
 
-        img = img + apply_gate(
-            self.img_attn_proj(img_attn) + self.img_attn_prope_proj(img_attn_prope),
-            gate=img_mod1_gate,
+        attn_output = self.img_attn_proj(img_attn) + self.img_attn_prope_proj(
+            img_attn_prope
         )
-        img = img + apply_gate(
-            self.img_mlp(
-                modulate(
-                    self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale
-                )
-            ),
-            gate=img_mod2_gate,
+        attn_output = sdtm_ctx.unmerge_attn(attn_output, phase="attn_output")
+        store_sdtm_feature(
+            getattr(self, "_sdtm_info", None), "attn_output", block_idx, attn_output
         )
+        img = img + apply_gate(attn_output, gate=img_mod1_gate)
+
+        mlp_input = self.img_norm2(img)
+        mlp_input = modulate(mlp_input, shift=img_mod2_shift, scale=img_mod2_scale)
+        mlp_input = sdtm_ctx.merge_mlp(mlp_input)
+        mlp_output = self.img_mlp(mlp_input)
+        mlp_output = sdtm_ctx.unmerge_mlp(mlp_output, phase="mlp_output")
+        store_sdtm_feature(
+            getattr(self, "_sdtm_info", None), "mlp_output", block_idx, mlp_output
+        )
+        img = img + apply_gate(mlp_output, gate=img_mod2_gate)
 
         txt = txt + apply_gate(self.txt_attn_proj(txt_attn), gate=txt_mod1_gate)
         txt = txt + apply_gate(
@@ -1046,6 +1110,31 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
             block.disable_deterministic()
         for block in self.single_blocks:
             block.disable_deterministic()
+
+    def enable_sdtm(self, **kwargs):
+        self._sdtm_info = build_sdtm_info(**kwargs)
+        self._sdtm_info["states"]["layer_count"] = len(self.double_blocks)
+        for block in self.double_blocks:
+            block._sdtm_info = self._sdtm_info
+        return self
+
+    def disable_sdtm(self):
+        disable_sdtm(self)
+        for block in self.double_blocks:
+            if hasattr(block, "_sdtm_info"):
+                block._sdtm_info["states"]["enabled"] = False
+        return self
+
+    def sdtm_begin(self, step_count: int):
+        begin_sdtm_run(self, step_count)
+
+    def sdtm_set_step(
+        self,
+        step_current: int,
+        step_count: Optional[int] = None,
+        chunk_current: Optional[int] = None,
+    ):
+        set_sdtm_step(self, step_current, step_count, chunk_current)
 
     def get_rotary_pos_embed(self, rope_sizes):
         target_ndim = 3

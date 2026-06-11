@@ -1244,6 +1244,10 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                         dtype=self.target_dtype,
                         enabled=self.autocast_enabled,
                     ):
+                        if hasattr(self.transformer, "sdtm_set_step"):
+                            self.transformer.sdtm_set_step(
+                                i, len(timesteps), chunk_current=chunk_i
+                            )
                         noise_pred = self.transformer(
                             bi_inference=False,
                             ar_txt_inference=False,
@@ -1263,6 +1267,10 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                             start_rope_start_idx=len(selected_frame_indices),
                         )[0]
                         if self.do_classifier_free_guidance:
+                            if hasattr(self.transformer, "sdtm_set_step"):
+                                self.transformer.sdtm_set_step(
+                                    i, len(timesteps), chunk_current=chunk_i
+                                )
                             noise_pred_uncond = self.transformer(
                                 bi_inference=False,
                                 ar_txt_inference=False,
@@ -1438,6 +1446,10 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                         dtype=self.target_dtype,
                         enabled=self.autocast_enabled,
                     ):
+                        if hasattr(self.transformer, "sdtm_set_step"):
+                            self.transformer.sdtm_set_step(
+                                i, len(timesteps), chunk_current=chunk_i
+                            )
                         output = self.transformer(
                             bi_inference=True,
                             ar_txt_inference=False,
@@ -1850,6 +1862,8 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         self.chunk_num = latent_frames // chunk_latent_frames
         self.chunk_latent_frames = chunk_latent_frames
         self.num_inference_steps = num_inference_steps
+        if hasattr(self.transformer, "sdtm_begin"):
+            self.transformer.sdtm_begin(num_inference_steps)
 
         if model_type == "ar":
             latents = self.ar_rollout(
