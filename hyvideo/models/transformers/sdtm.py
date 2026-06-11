@@ -7,6 +7,8 @@ import torch.nn.functional as F
 
 
 def _gather(input_tensor: torch.Tensor, dim: int, index: torch.Tensor) -> torch.Tensor:
+    if index.device != input_tensor.device:
+        index = index.to(input_tensor.device)
     if input_tensor.device.type == "mps" and input_tensor.shape[-1] == 1:
         return torch.gather(
             input_tensor.unsqueeze(-1),
@@ -85,6 +87,10 @@ def begin_sdtm_run(module: torch.nn.Module, step_count: int):
     info["features"] = {"attn_output": {}, "mlp_output": {}}
 
 
+def _clear_sdtm_features(info: Dict[str, Any]):
+    info["features"] = {"attn_output": {}, "mlp_output": {}}
+
+
 def set_sdtm_step(
     module: torch.nn.Module,
     step_current: int,
@@ -112,6 +118,8 @@ def store_sdtm_feature(
     tensor: torch.Tensor,
 ):
     if not info or not info.get("states", {}).get("enabled", False):
+        return
+    if info.get("states", {}).get("cache_vision_current", False):
         return
     if not info.get("args", {}).get("cache_each_step", True):
         return
@@ -698,16 +706,19 @@ def get_sdtm_context(
     block_idx: Optional[int],
     cache_vision: bool = False,
 ) -> SDTMMergeContext:
-    if (
-        info is None
-        or not info.get("states", {}).get("enabled", False)
-        or cache_vision
-        or attn_param is None
-        or "thw" not in attn_param
-    ):
+    if info is None or not info.get("states", {}).get("enabled", False):
         return SDTMMergeContext(info)
 
     states = info["states"]
+    if cache_vision:
+        states["cache_vision_current"] = True
+        _clear_sdtm_features(info)
+        return SDTMMergeContext(info)
+
+    states["cache_vision_current"] = False
+    if attn_param is None or "thw" not in attn_param:
+        return SDTMMergeContext(info)
+
     args = info["args"]
     states["layer_current"] = int(block_idx or 0)
     if states.get("layer_count") is None:
